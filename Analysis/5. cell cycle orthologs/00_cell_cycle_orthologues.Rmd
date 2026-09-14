@@ -1,0 +1,602 @@
+---
+title: 'Cdh Project: retrieving cell cycle orthologues'
+author: "Alberto Perez-Posada"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+wdir = "/omics-storage/lab-solana/alberto/projects/cellcycle/"
+fcha <- function(){ gsub("-","",Sys.Date()) }
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_knit$set(root.dir = wdir)
+options(scipen=999)
+options(family="ArialMT")
+Sys.setenv(VROOM_CONNECTION_SIZE=5000072)
+```
+
+## About
+
+```{r}
+setwd('/omics-storage/lab-solana/alberto/projects/cellcycle')
+```
+
+## Load packages
+
+```{r, message = FALSE}
+library("vroom")
+library("dplyr")
+library("tidyr")
+library("reshape2")
+library("stringi")
+```
+
+## Load functions and planarian gene annotation info
+
+```{r, message = FALSE}
+source("./code/r_code/r_functions/sourcefolder.R")
+sourceFolder("./code/r_code/r_functions/")
+```
+
+```{r}
+rosetta <- read.delim2("/omics-storage/lab-solana/standard_references/Smed_Rink/20231127_Rosetta_EXTENDED.tsv", header = TRUE)
+```
+
+## Load orthogroups
+
+We load the orthogroups file resulting from OrthoFinder:
+
+```{r pressure, echo=FALSE}
+ogs0 <- vroom(
+  file = "outputs/orthofinder/20260115_orthofinder_cellcycle_inflation15/Results_Jan15/Orthogroups/Orthogroups.tsv"
+  # file = "outputs/orthofinder/20250620_orthofinder_cellcycle_inflation2/Results_Jun20/Orthogroups/Orthogroups.tsv"
+)
+
+head(ogs0)
+```
+
+## Load cell cycle genes from model organism species
+
+This comes from the Dabydeen et al., paper where they retrieve cell cycle genes from all of these species.
+NOTE: In addition, we have expanded this list by looking for genes annotated with cell cycle ontologies in UNIPROT (Search terms: "regulation of cell cycle" AND ((organism_id:9606) OR (organism_id:10090) OR (organism_id:7227)) ).
+Here we merge both lists, for each species.
+
+```{r}
+cyc_uniprot <- read.delim2("data/cellcycle_references/uniprotkb_regulation_of_cell_cycle_AND_2025_11_07.tsv")
+
+#hsap
+hsap_cyc <- cyc_uniprot[cyc_uniprot$Organism == "Homo sapiens (Human)",c(1,3,4,5,6)]
+hsap_cyc2 <- read.delim2("data/cellcycle_references/dabydeen_cellcycle_genes_hsap_uniprot.tsv")
+hsap_cyc <- unique(rbind(hsap_cyc, hsap_cyc2[,c(2,4,5,6,7)]))
+#mmus
+mmus_cyc <- cyc_uniprot[cyc_uniprot$Organism == "Mus musculus (Mouse)",c(1,3,4,5,6)]
+mmus_cyc2 <- read.delim2("data/cellcycle_references/dabydeen_cellcycle_genes_mmus_uniprot.tsv")
+mmus_cyc <- unique(rbind(mmus_cyc, mmus_cyc2[,c(2,4,5,6,7)]))
+#dmel
+dmel_cyc <- cyc_uniprot[cyc_uniprot$Organism == "Drosophila melanogaster (Fruit fly)",c(1,3,4,5,6)]
+dmel_cyc2 <- read.delim2("data/cellcycle_references/dabydeen_cellcycle_genes_dmel_uniprot.tsv")
+dmel_cyc <- unique(rbind(dmel_cyc, dmel_cyc2[,c(2,4,5,6,7)]))
+```
+
+We will now tidy up a little bit the protein IDs of the genes from these model organisms so they match with those of the cell cycle lists
+
+```{r}
+ogs <- ogs0[,c("Orthogroup", "Smed", "Dmel", "Hsap", "Mmus")]
+
+ogs$Hsap <- gsub(" ", "", sub("\\|.*","",gsub("\\|[^,]+,",",",gsub("sp\\||tr\\|","",ogs$Hsap))))
+ogs$Mmus <- gsub(" ", "", sub("\\|.*","",gsub("\\|[^,]+,",",",gsub("sp\\||tr\\|","",ogs$Mmus))))
+ogs$Dmel <- gsub(" ", "", sub("\\|.*","",gsub("\\|[^,]+,",",",gsub("sp\\||tr\\|","",ogs$Dmel))))
+```
+
+We also remove ANY orthogroup that does NOT contain Smed genes.
+
+```{r}
+ogs <- ogs[!(is.na ( ogs$Smed)),]
+```
+
+Create and properly format a table with every TF protein + orthogroup + symbol ID etc.
+
+For this we will get the families in a format family <--> gene. And then, in the ones from model organisms, we subset only to keep those genes with annotation in the cell cycle lists.
+
+We do this for smed, hsap, mmus, and dmel.
+
+```{r}
+# smed
+smed_fams <- as.data.frame( 
+  ogs[,c(1,2)] %>% 
+    melt("Smed") %>%
+    mutate(Smed=strsplit(Smed, ",")) %>% 
+    unnest(Smed)
+)[,c(1,3)] ; colnames(smed_fams) = c("id","og")
+
+#hsap
+hsap_fams <- as.data.frame(
+  ogs[c(1,4)] %>% 
+    melt("Hsap") %>%
+    mutate(Hsap=strsplit(Hsap, ", ")) %>% 
+    unnest(Hsap)
+)[,c(1,3)] ; colnames(hsap_fams) = c("id","og")
+
+hsap_fams <- merge(
+  hsap_fams,
+  hsap_cyc,
+  by.x = 1,
+  by.y = 1,
+  all = F
+)
+
+#dmel
+dmel_fams <- as.data.frame(
+  ogs[,c(1,3)] %>% 
+    melt("Dmel") %>%
+    mutate(Dmel=strsplit(Dmel, ",")) %>% 
+    unnest(Dmel)
+)[,c(1,3)] ; colnames(dmel_fams) = c("id","og")
+
+dmel_fams <- merge(
+  dmel_fams,
+  dmel_cyc,
+  by.x = 1,
+  by.y = 1,
+  all = F
+)
+
+#mmus
+mmus_fams <-as.data.frame(
+  ogs[,c(1,5)] %>% 
+    melt("Mmus") %>%
+    mutate(Mmus=strsplit(Mmus, ",")) %>% 
+    unnest(Mmus)
+)[,c(1,3)] ; colnames(mmus_fams) = c("id","og")
+
+mmus_fams <- merge(
+  mmus_fams,
+  mmus_cyc,
+  by.x = 1,
+  by.y = 1,
+  all = F
+)
+```
+
+We merge all of the gene family files from dmel, hsap, mmus, and we rename the columns
+
+```{r}
+# Merging of all the gfams
+fams_merging <- unique(
+      merge(
+        dmel_fams[,c(2,1,4:6)],
+        merge(
+          hsap_fams[,c(2,1,4:6)],
+          mmus_fams[,c(2,1,4:6)],
+          by=1,
+          all=T
+        ),
+        by=1,
+        all=T
+      ))
+
+colnames(fams_merging)[6:9] <- paste0("Hsap_",colnames(fams_merging)[2:5])
+colnames(fams_merging)[10:13] <- paste0("Mmus_",colnames(fams_merging)[2:5])
+colnames(fams_merging)[2:5] <- paste0("Dmel_",colnames(fams_merging)[2:5])
+```
+
+We provide a collapsed set of gene symbols based on the cell cycle lists.
+
+```{r}
+fams_merging$sym <-
+  apply(fams_merging, 1, function(x) {
+    paste(unique(x[c(4,8,12)]), collapse = ",")
+  })
+
+fams_cycs <-
+  aggregate(
+    fams_merging,
+    by = list(fams_merging$og),
+    FUN = function(x) {
+      paste(unique(x), collapse = ",")
+    }
+  )[, -1]
+```
+
+Finally, we merge in the Smed gene <--> family annotations, with the cell cycle gene families from model organisms.
+
+```{r}
+smed_cyc <-
+  merge(
+    smed_fams,
+    fams_cycs,
+    by.x = 2,
+    by.y = 1
+  )
+```
+
+Since we've been working with orthofinder, and this has protein (~transcript) IDs, and our datasets are centered around genes, we will translate the protein/transcriptIDs into gene IDs.
+
+```{r}
+smed_cyc$id <-
+  translate_ids(
+    gsub(" ", "", smed_cyc$id), dict = rosetta[,c(2,1)]
+  )
+```
+
+In addition, we will provide an additional source of annotation: we will also grab any gene that received the cell cycle category of COGs, which is labelled D, during the gene annotation process (carried out with eggNOG at the beginning when we got this genome from the Rink Lab).
+
+For this we will iterate over the gene/COG list and return TRUE if any of the COGs of a given gene is "D".
+
+```{r}
+f_cyc = 
+  sapply(
+    rosetta$COG_category,
+    function(x, cogs){
+      a = strsplit(x,"")[[1]]
+      any(a %in% cogs)
+      },
+    cogs = c("D")
+    )
+```
+
+This filter, together with the genes retrieved from Orthofinder, will constitute the initial list of cell cycle genes.
+
+```{r}
+cycs <-
+  unique(
+    c(
+      smed_cyc$id,
+      rosetta$gene[f_cyc]
+    )
+  )
+length(cycs)
+```
+
+We can later expand this and have a better look based on overall gene expression.
+
+Which we are going to do first by looking at the overall gene score of these genes in one of our single cell atlases.
+
+## Assessing how informative these candidate cell cycle genes are
+
+To assess this we will look at the gene score of the different planarian cell types based on these cell cycle genes.
+
+We will load the dataset here.
+
+```{r}
+scdata <- readRDS("/omics-storage/lab-solana/alberto/projects/smed_cisreg/outputs/rda/seurat_scrna/smed_cisreg_scRNA_consensus_identities.RDS")
+# gene scores
+```
+
+Some colours for the cell types
+
+```{r}
+broadcols <-
+  setNames(
+    c( "#969696", "#9ECAE1", "#56A0CE", "#2171B5", 
+       "#228B22", "#869E42", "#B22222", "#FEC44F", 
+       "#FF69B4", "#FFB0AB", "#6428C8" ),
+    unique(sort(scdata$broadtype_splitbam))[c(6,2,4,3,9,1,5,7,8,10,11)]
+  )
+```
+
+We will create a data frame with the cell information, which will be the basis for the plot, together with the gene scores.
+
+```{r}
+df_scores <-
+  data.frame(
+    cell = colnames(scdata), # cells
+    cluster =  factor(scdata$broadtype_splitbam, levels = unique(sort(scdata$broadtype_splitbam))[c(6,2,4,3,9,1,5,7,8,10,11)] ),
+    ctype = scdata$ctype
+  )
+```
+
+We will define the required input for the gene score function. For example, the total gene pool will be all of the genes with detected expression in this single cell atlas.
+
+```{r}
+mat = scdata@assays$RNA@data
+all_genes = rownames(mat)
+```
+
+We run the function. After running the function, we will relativise the score (0 = min, 1 = max), and will clip outlier values to improve the readability of thep plot.
+
+```{r}
+score_cyc <-
+  gene_score(
+    x = mat, gene_set = cycs[cycs %in% rownames(mat)],
+    gene_pool = all_genes, remove_set_from_pool = TRUE,
+    fraction = 0.1
+  )
+df_scores$score_cyc <- score_cyc
+df_scores$score_cyc_rel <- relativise( clip_q( clip_q(score_cyc, q=.05,method = "down"), method = "up") )
+```
+
+We will only show a fixed number of genes as individual jittered data points, otherwise the plot will be too cluttered.
+
+And then we show the plot
+
+```{r, fig.width = 4.5, fig.height = 6}
+set.seed(123)
+z <- df_scores %>% group_by(cluster) %>% sample_n(200) %>% .$cell
+df_scores$jit <- ifelse(df_scores$cell %in% z, TRUE, FALSE)
+
+set.seed(1234)
+p_sco_cyc <-
+  df_scores %>%
+    ggplot(mapping = aes(x = cluster, y = score_cyc_rel, fill = cluster, color = cluster)) +
+    geom_boxplot(outlier.shape = NA)+
+    geom_jitter(mapping = aes(shape=jit),size = .6, alpha = .25)+
+    theme_classic()+
+    scale_fill_manual(values = broadcols)+
+    scale_color_manual(values = darken(broadcols,0.5))+
+    scale_shape_manual(values = setNames(c(20,NA),c("TRUE","FALSE")))+
+    theme(axis.text.x = element_blank())+
+    theme(legend.position = "none")+
+    ylab(label = "score cellcycle")+
+    coord_cartesian(ylim=c(0,1))+
+    labs(title="score cellcycle")
+
+p_sco_cyc
+```
+
+Seems that it's working, to an extent, as we expect neoblast to have a higher score than the rest of cell types. It is definitely worth to keep digging and having a look at these genes.
+
+We will export this list of candidate cell cycle genes so we can further explore it in a dataset with more resolution.
+
+```{r}
+write.table(
+  x = cycs,
+  file = paste0("outputs/gene_annotation/",fcha(),"_smed_candidate_cellcycle_genes.txt"),
+  row.names = FALSE,
+  col.names = FALSE,
+  quote = FALSE
+)
+```
+
+## Checking for expression of these genes in neoblasts
+
+```{r}
+library(Seurat)
+library(vroom)
+library(Matrix)
+```
+
+```{r}
+cdh_cell_metadata <- read.csv("data/matrices/whole_atlas/cells_metadata.csv")
+cdh_gene_metadata <- read.csv("data/matrices/whole_atlas/all_genes_metadata.csv")
+
+# Load the matrix
+cdh_raw_counts <- readMM(file = "data/matrices/whole_atlas/raw.mtx.gz")
+cdh_raw_counts <- t(cdh_raw_counts)
+rownames(cdh_raw_counts) <-  cdh_gene_metadata$X
+colnames(cdh_raw_counts) <-  cdh_cell_metadata$X
+```
+
+
+```{r}
+# pseudobulk_rep using pseudorepls, querying for (neoblasts+progs) vs else
+cdh_ps_rep <-
+  pseudobulk_cond_rep(
+    x = cdh_raw_counts,
+    identities = rep("CDH",ncol(cdh_raw_counts)),
+    conditions = 
+      setNames(
+        factor(
+          ifelse(
+            cdh_cell_metadata$annotated_names %in% 
+              c( grep("neo",unique(cdh_cell_metadata$annotated_names), va = T),
+                 grep("progenitor",cdh_cell_metadata$annotated_names, va = T)
+                 ),
+            "neo","else"
+            ),
+          levels = c("neo","else")
+        ),
+        cdh_cell_metadata$X
+      ),
+    replicates = 
+      setNames(
+        factor(
+          cdh_cell_metadata$Pseudoreplicate,
+          levels = c("PS_1","PS_2","PS_3")
+          ), 
+        cdh_cell_metadata$X
+        )
+  )
+```
+
+
+```{r}
+rownames(cdh_ps_rep$matrix) <- rownames(cdh_raw_counts)
+
+sampletable <-
+  cdh_ps_rep$sampletable
+
+sampletable$condition <- factor(sampletable$condition, levels = c("neo","else"))
+sampletable$replicate <- factor(sampletable$replicate, levels = c("PS_1", "PS_2", "PS_3"))
+```
+
+
+```{r}
+cdh_dge_neo_else <- 
+  deseq_sc(
+    m = round(cdh_ps_rep$matrix),
+    d = sampletable,
+    p_threshold = 0.1,
+    contrast_info = c("condition","neo","else"),
+    cell = "CDH"
+  )
+```
+
+
+```{r}
+cycs_good <- 
+  rownames(
+    cdh_dge_neo_else$res[
+      rownames(cdh_dge_neo_else$res) %in% cycs &
+        cdh_dge_neo_else$res$log2FoldChange > 0 &
+        cdh_dge_neo_else$res$padj < 0.1,
+      ]
+    )
+```
+
+
+
+```{r, fig.width = 5, fig.height = 5}
+df_res <- cdh_dge_neo_else$res
+df_res$padj[df_res$padj == min(df_res$padj)] <- unique(sort(df_res$padj))[2]
+df_res$deg <- factor(ifelse(rownames(df_res) %in% cycs_good, "DEG","none"), levels = c("none","DEG"))
+df_res <- df_res[order(df_res$deg),]
+
+p_v <- volcano_plot(d = df_res)
+p_v
+```
+
+
+
+```{r}
+# evaluation by visual inspection
+df_scores$score_cyc_GOOD <-
+  gene_score(
+    x = mat, gene_set = cycs_good[cycs_good %in% rownames(mat)],
+    gene_pool = all_genes, remove_set_from_pool = TRUE,
+    fraction = 0.1
+  )
+df_scores$score_cyc_good_rel <- relativise( clip_q( clip_q(df_scores$score_cyc_GOOD, q=.05,method = "down"), method = "up") )
+```
+
+
+```{r}
+set.seed(1234)
+p_sco_cyc_good <-
+  df_scores %>%
+  ggplot(mapping = aes(x = cluster, y = score_cyc_good_rel, fill = cluster, color = cluster)) +
+  geom_boxplot(outlier.shape = NA)+
+  geom_jitter(mapping = aes(shape=jit),size = .6, alpha = .25)+
+  theme_classic()+
+  scale_fill_manual(values = broadcols)+
+  scale_color_manual(values = darken(broadcols,0.5))+
+  scale_shape_manual(values = setNames(c(20,NA),c("TRUE","FALSE")))+
+  theme(axis.text.x = element_blank())+
+  theme(legend.position = "none")+
+  ylab(label = "score cellcycle")+
+  coord_cartesian(ylim=c(0,1))+
+  labs(title="score cellcycle")
+```
+
+
+```{r, fig.width = 8, fig.height = 4, warning = FALSE, message = FALSE}
+l_p <- list(
+  volcano = p_v,
+  sco_cyc_good = p_sco_cyc_good
+  )
+cowplot::plot_grid(plotlist = l_p, ncol = 2)
+```
+```{r, warning=FALSE, message = FALSE}
+pdf("graphics/smed_candidate_cellcycle_genes.pdf",wi = 8, he = 4)
+cowplot::plot_grid(plotlist = l_p, ncol = 2)
+dev.off()
+```
+
+
+
+```{r}
+write.table(cycs_good,paste0("outputs/",fcha(),"_cellcycle_genes_v1.txt"),row.names = FALSE, col.names = FALSE, quote = FALSE)
+```
+
+
+
+## Saving everything
+
+```{r}
+save(
+  rosetta,
+  smed_cyc,
+  ogs,
+  ogs0,
+  hsap_cyc,
+  hsap_fams,
+  mmus_cyc,
+  mmus_fams,
+  dmel_cyc,
+  dmel_fams,
+  fams_cycs,
+  smed_fams,
+  cycs,
+  cdh_dge_neo_else,
+  cycs_good,
+  file = paste0("outputs/rda/",fcha(),"_cell_cycle_orthologues_rmdData.rda")
+)
+```
+
+## ADDITIONAL: Checking for previously described absences of cellcycle genes in planaria
+
+```{r}
+# find all the respective smed genes, if any, and how many.
+sophie_genes <- read.delim2("data/cellcycle_references/20251130_potential_lost_cellcycle_genes_in_planaria.tsv", header = FALSE, col.names = c("ID","symbol"))
+
+# grab ogs0
+# grab hsap column
+ogs0_hsap <-
+  ogs0[,c(1,12)]
+
+# keep non-na
+ogs0_hsap <- ogs0_hsap[complete.cases(ogs0_hsap),]
+
+# split by gene
+l_ogs0_hsap <- 
+  lapply(
+    split(
+      ogs0_hsap$Hsap,
+      ogs0_hsap$Orthogroup
+    ),
+    function(x){
+      unlist(strsplit(gsub(" ","",x), ","))
+    }
+  )
+
+# cleanup IDs, keep only the alphanumeric code
+l_ogs0_hsap <- lapply(l_ogs0_hsap, function(x){gsub("\\|.*","",gsub("^[A-Za-z]+\\|","",x))})
+l_ogs0_hsap <- stack(l_ogs0_hsap)
+colnames(l_ogs0_hsap) <- c("hsap_ID","Orthogroup")
+
+# merge this list of OGs with those of sophie. Keeping only the ones in the list of genes
+ogs_hsap_sophie <- 
+  merge(
+    l_ogs0_hsap,
+    sophie_genes,
+    by.x = 1,
+    by.y = 1
+  )
+
+# subset list of OGs by keeping OGs with orthologues in the list of sophie genes
+ogs_smed_lost <-
+  ogs0[
+    ogs0$Orthogroup %in% ogs_hsap_sophie$Orthogroup,
+  ]
+
+# add true/false if any smed gene found
+ogs_hsap_sophie$has_coorthologues_in_smed <-
+  ifelse(
+    ogs_hsap_sophie$Orthogroup %in% ogs_smed_lost$Orthogroup[complete.cases(ogs_smed_lost$Smed)],
+    TRUE, FALSE
+  )
+
+# add the smed genes found, if any. Remember this is protein ID!!
+ogs_hsap_sophie <- merge(ogs_hsap_sophie, ogs_smed_lost[,c(1,18)], by.x = 2, by.y = 1)
+
+# tidy up reordering...
+ogs_hsap_sophie <- ogs_hsap_sophie[order(ogs_hsap_sophie$has_coorthologues_in_smed,ogs_hsap_sophie$symbol),]
+
+# saving, ver.1
+save_to_excel(list(smed_putative_lost_genes = ogs_hsap_sophie), output_file_name = "outputs/putative_lost_and_kept_genes.xlsx",rowNames =  FALSE, overwrite = TRUE)
+
+# abc <- 
+#   unname(unlist(sapply(ogs_hsap_sophie$Smed, function(x){unlist(strsplit(gsub(" ","",x),","))})))
+# abc = sort(unique(abc[complete.cases(abc)]))
+# 
+# View(
+#   rosetta[rosetta$gene %in% intersect(cycs_good,rosetta$gene[rosetta$longest_isoform %in% abc]),])
+
+```
+
+
+## The End
+
+```{r}
+sessionInfo()
+```

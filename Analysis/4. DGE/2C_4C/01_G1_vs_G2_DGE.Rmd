@@ -1,0 +1,235 @@
+---
+title: 'Cdh1 Project: Identify G1/G2 genes'
+author: "Alberto Perez-Posada"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+wdir = "./"
+print (getwd())
+fcha <- function(){ gsub("-","",Sys.Date()) }
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_knit$set(root.dir = wdir)
+options(scipen=999)
+options(family="ArialMT")
+Sys.setenv(VROOM_CONNECTION_SIZE=5000072)
+```
+
+## About
+
+In this markdown we will compare the gene expression of "high-neoblastScore" cells coming from G1 or G2 samples. For that we will use DESeq2. Since we do not have replicates, we will generate pseudo-replicates.
+
+## Preparation
+
+We will load the functions and packages required:
+
+```{r load_packages, warning = FALSE, message = FALSE}
+library(Matrix)
+library(DESeq2)
+library(colorspace)
+library(ggplot2)
+library(Seurat)
+#library(openxlsx)
+#library(ggrastr)
+```
+
+```{r load_functions, warning = FALSE, message = FALSE}
+source("../../Common R Functions/sourcefolder.R")
+sourceFolder("../../Common R Functions/", recursive = TRUE)
+```
+
+Loading gene information
+This file is the same that was used in: 
+  Pérez-Posada, A., García-Castro, H., Emili, E. et al. 
+  Multimodal single cell analyses reveal gene networks of planarian stem cell differentiation. 
+  Nat Commun 16, 10683 (2025). https://doi.org/10.1038/s41467-025-65712-0
+  supplementary data 2
+
+```{r}
+# Load gene information
+rosetta <- read.delim2(
+  "../../../annotation/rosetta_202311XX_with_wgcna_column.tsv",
+  header = TRUE
+)
+```
+
+## Loading and preparing the gene expression data
+
+Loading the original matrices of "high neoblastScore" cells. Please note that countsplit works with "cells in rows, genes in columns", which is opposite of Seurat. This is easily interconverted using the transpose (`t()`) R function.
+
+```{r}
+# Load the original matrix
+X <- Matrix::readMM(file = "./raw_for_DGE.mtx.gz")
+
+# Load the cells metadata from CSV
+X_metadata <- read.csv("cells_metadata_for_DGE.csv")
+rownames(X) <- X_metadata$X
+
+# Load the gene metadata from CSV
+X_gene_metadata <- read.csv("all_genes_metadata_for_DGE.csv")
+colnames(X) <- X_gene_metadata$X
+```
+
+## Using pseudoreplicates by splitting the dataset into two:
+
+First we will quickly calculate differential gene expression using our conventional pseudobulk of splitting the cells.
+
+```{r}
+X_ <- t(X)
+```
+
+We will create a vector of pseudo-replicates by randomly assigning one of either two "R1" or "R2" labels to each cell on this dataset.
+
+```{r}
+set.seed(1234)
+X_ps <- factor(sample(c("R1","R2"),ncol(X_),replace = TRUE),levels = c("R1","R2"))
+```
+
+We run our pseudobulk function that leverages clusters, conditions, and replicates (even if we just have one single "cluster", that is, the whole dataset)
+
+```{r}
+X_ps_rep <-
+  pseudobulk_cond_rep(
+    x = X_,
+    identities = factor(rep("hi_neo",ncol(X_))),
+    conditions = factor(X_metadata$Condition, levels = c("G1","G2","G1-G2")),
+    replicates = X_ps
+  )
+```
+
+We transform the condition column into a factor:
+
+```{r}
+X_ps_rep$sampletable$condition = 
+  factor(X_ps_rep$sampletable$condition, levels = c("G1","G2","G1-G2"))
+```
+
+And finally the differential gene expression analysis:
+
+```{r}
+X_deg <-
+  deseq_pseudobulk(count_matrix = X_ps_rep$matrix,samples_info = X_ps_rep$sampletable, celltype = "hi_neo",contrast_info = c("condition","G2","G1"), p_threshold = 0.05)
+X_deg$res = X_deg$res[complete.cases(X_deg$res),]
+X_deg$res$deg = ifelse(X_deg$res$padj < 0.05, "DEG", "none")
+
+```
+
+Here we will visualise the results. Please note that we are not using log2FC threshold in this case.
+
+```{r, fig.width = 5, fig.height = 5}
+volcano_plot(X_deg$res)
+```
+
+We will check for example the expression of piwi, which is reported as significantly over-expressed in G2 cells:
+
+```{r, fig.width = 3.5, fig.height = 3.5}
+piwi = "h1SMcG0013999"
+plotCounts(X_deg$dds, gene = piwi)
+```
+
+We will extract the results here:
+
+```{r}
+res = X_deg$res
+
+res = res[complete.cases(res),]
+
+res = res[rownames(res) %in% X_deg$diffgenes,]
+```
+
+We will add a column that considers whether the DEG is up- or down-regulated depending on the sign of the log2FC:
+
+```{r}
+res$up_down = ifelse(res$log2FoldChange > 0, "up-regulated", "down-regulated")
+```
+
+
+## Writing and saving the results
+
+We will store the results in a more tidy fashion.
+
+We will merge our DGE results with some useful annotations from our gene annotation table, including protein domains, putative gene names, and equivalent geneIDs in previous planarian gene annotations.
+
+```{r}
+results_g1g2 <-
+  res[res$deg == "DEG",]
+
+results_g1g2$overexpressed_in <-
+  ifelse(results_g1g2$log2FoldChange > 0, "G2", "G1")
+
+results_g1g2 <-
+  merge(
+    results_g1g2,
+    rosetta[,c("gene","gene_ddv6","Description.x","Preferred_name","PFAMs","Class")],
+    by.x = 0,
+    by.y = 1,
+    all.x = TRUE
+  )
+
+results_g1g2 <- results_g1g2[order(results_g1g2$overexpressed_in,results_g1g2$padj),]
+rownames(results_g1g2) <- NULL
+colnames(results_g1g2)[1] <- "geneID"
+
+outfile <- "outputs/G1_vs_G2_diffExpGenes.xlsx"
+
+if (file.exists(outfile)) {
+  file.remove(outfile)
+}
+
+save_to_excel(
+  list_of_objects = list(results_g1g2 = results_g1g2),
+  output_file_name = outfile
+)
+```
+
+
+```{r}
+save_to_excel(
+  list_of_objects =
+    list(G1G2_diffgenes = X_deg$diffgenes),
+  output_file_name = "outputs/G1_vs_G2_diffExpGenes_listOnly.xlsx",
+  rowNames = FALSE
+)
+```
+
+```{r}
+save_to_excel(
+  list_of_objects =
+    list(DGE_results = X_deg$res),
+  output_file_name = "outputs/G1_vs_G2_diffExpGenes_results_all.xlsx",
+  rowNames = TRUE
+)
+```
+
+We also save everything:
+
+```{r}
+save(
+  rosetta,
+  X,
+  X_metadata,
+  X_gene_metadata,
+  X_,
+  X_ps_rep,
+  X_deg,
+  res,
+  results_g1g2,
+  file = "./outputs/20251203_G1_vs_G2_diffexp.rda"
+)
+```
+
+And a plot:
+
+```{r}
+pdf("./outputs/G1_vs_G2_DGE_volcano.pdf", wi = 5, he = 5)
+volcano_plot(X_deg$res, fc_thres = 0)
+dev.off()
+```
+
+
+## The End!
+
+```{r}
+sessionInfo()
+```

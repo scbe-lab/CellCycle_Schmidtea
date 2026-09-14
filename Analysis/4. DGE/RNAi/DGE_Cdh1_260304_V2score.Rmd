@@ -1,0 +1,575 @@
+---
+title: "Differential Gene Expression using computational dissection of our single cell data"
+author: "Alberto Perez-Posada"
+date: "2024-12-06"
+output:
+  html_document: default
+  pdf_document: default
+editor_options: 
+  markdown: 
+    wrap: sentence
+---
+
+```{r setup, include=FALSE}
+dir <- "C:/Users/sophie.peron/OneDrive - University of Exeter/Cell Cycle G1G2 CDH1 paper shared folder/Figure Jupyter Notebooks/h5ad/analysis_250528_f/DGE/Cdh1"
+#dir <- "C:/Users/sp1046/OneDrive - University of Exeter/Cell Cycle G1G2 CDH1 paper shared folder/Figure Jupyter Notebooks/h5ad/analysis_250528_f/DGE/Cdh1"
+setwd(dir)
+fcha <- function(){ gsub("-","",Sys.Date()) }
+
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_knit$set(root.dir = dir)
+options(scipen=999)
+Sys.setenv(VROOM_CONNECTION_SIZE=5000072)
+```
+
+## About
+
+Differential gene expression analysis after RNAi treatment: aggregation of tte data into pseudobulk counts, differential gene expression analysis at the level of the broad groups using DESeq
+
+## Load libraries
+
+```{r libraries, message=FALSE, warning=FALSE}
+require(ComplexHeatmap)
+library(colorspace)
+library(cowplot)
+require(DESeq2)
+require(dplyr)
+library(eulerr)
+require(ggplot2)
+library(ggrepel)
+library(ggrastr)
+library(gridExtra)
+library(readr)
+library(Matrix)
+```
+
+## Load functions
+
+We use here a wrapper of DESeq and a couple of plotting functions:
+
+ - It takes the a count matrix and a samples information matrix to perform DGE analysis.
+ - If no DGEs are found, it ends with a message indicating so.
+ - If it only finds one DGE, it reports its ID.
+ - If it finds more than one DGE, it proceeds to plot a volcano plot and a heatmap of normalised gene expression.
+ - In the two latter cases, a list of things is returned: the DESeq2 object which contains the whole DGE analysis, the results table from running DESeq2, and a list of differentially expressed genes.
+
+```{r load_functions}
+source("../../Common R Functions/sourcefolder.R")
+sourceFolder("../../Common R Functions/", recursive = TRUE)
+```
+
+## Load data
+
+```{r load_data}
+
+# Load metadata
+Idents <- read.delim2("rnai_cells_metadata_for_DGE.csv",
+sep = "," , header = TRUE)
+
+# Load the matrix
+matrix_X <- t(readMM(file = "rnai_raw_for_DGE.mtx.gz"))
+colnames(matrix_X) <- read.csv("rnai_cells_metadata_for_DGE.csv")[,1]
+rownames(matrix_X) <- read.csv("rnai_all_genes_metadata_for_DGE.csv")[,1]
+matrix_X <- matrix_X[,colnames(matrix_X) %in% Idents$X]
+
+```
+
+## Pseudobulk at the cluster/condition/replicate intersection
+
+### Count matrix
+
+We retrieve a pseudobulk matrix by taking into account the cell type, the replicate and experimental condition. This will effectively retrieve a matrix of "pseudo-samples", where a sample is any combination of the following: "cell type" + "experimental condition" + "replicate" .
+
+We separate the cells in 3 categories based on the neoblast score.
+
+```{r}
+Idents <- Idents %>%
+  mutate(
+    cell_category = case_when(
+      neoblast_score > 0.259 ~ "neoblasts",
+      neoblast_score <= 0.259 & neoblast_score > 0.171 ~ "progenitors",
+      neoblast_score < 0.171 ~ "differentiated"
+    ))
+
+```
+
+
+```{r psbulk_broad}
+# run pseudobulk
+scdata_metadata <- Idents
+cdh_psbulk_cond_rep_broad <- pseudobulk_cond_rep(
+  x = matrix_X,
+  identities = scdata_metadata$cell_category,
+  conditions = scdata_metadata$Condition,
+  replicates = scdata_metadata$Replicate
+)
+```
+
+
+```{r}
+# check the count matrix
+cdh_psbulk_cond_rep_broad$matrix[1:5,1:5]
+```
+
+```{r}
+dim(cdh_psbulk_cond_rep_broad$matrix)
+```
+
+### Sample Information table
+
+This table help providing DESeq2 with all the relevant information for the samples.
+The layout is something like this:
+
+```
+sample condition replicate
+S01    Cdh1     1
+S12    GFP      1
+S23    Cdh1     2
+S34    GFP      2
+```
+
+Every row corresponds to a column in the counts matrix and it has the descriptions of what they are.
+
+Column "sample" must be the names of the columns in the count matrix.
+necessary columns: 'condition' with the identity of the experiment, and  'replicate' with the identity of the replicate of the experiment.
+
+```{r parse_sampletable}
+clean_sampletable <- function(s){
+  s <- s[s$condition != "",]
+  s <-
+    s[
+      s$ctype %in%
+        names(table(s$ctype))[ # those cell types
+          table(s$ctype) == 
+            (length(unique(s$condition))*length(unique(s$replicate))) # possible combinations of condition x replicates 
+        ],
+    ]
+  s$condition <- factor(s$condition, levels = unique(s$condition))
+  
+  return(s)
+}
+
+# Broad cell type
+cdh_psbulk_cond_rep_broad$sampletable <- clean_sampletable(cdh_psbulk_cond_rep_broad$sampletable)
+head(cdh_psbulk_cond_rep_broad$sampletable)
+```
+
+
+
+```{r}
+cdh_sampletable_broad <- cdh_psbulk_cond_rep_broad$sampletable
+cdh_sampletable_broad$ctype <- 
+  factor(
+    cdh_sampletable_broad$ctype,
+    levels = unique(cdh_sampletable_broad$ctype)
+    )
+
+cdh_sampletable_broad$condition <- factor(cdh_sampletable_broad$condition, levels = c("Cdh1","H2B", "GFP"))
+cdh_sampletable_broad$replicate <- factor(cdh_sampletable_broad$replicate, levels = c("1","2"))
+head(cdh_sampletable_broad)
+```
+
+Filtering to exclude samples missing either a cell type, a condition or a replicate
+
+```{r}
+cdh_matrix_broad <- 
+  cdh_psbulk_cond_rep_broad$matrix[
+    ,
+    colnames(cdh_psbulk_cond_rep_broad$matrix) %in% cdh_sampletable_broad$sample
+  ]
+```
+
+## Analysis
+
+Here we run a massive DESeqwrapper for all cell types.
+
+This is a small wrapper of a much larger function called `deseq_sc`. 
+
+The small wrapper iterates over cell types, parses the sampletable and the expression matrix, and runs deseq for every cell type separately.
+
+The larger wrapper, `deseq_sc`, runs the following:
+
+ - It simplifies the sampletable data and grabs just the key minimal information to create a design matrix (i.e. condition, replicate, ...)
+ - It parses the information of the contrast and creates a formula accordingly
+ - It creates a DESeq2 object with this information plus the expression matrix supplied to the function (which contains the relevant columns in relation to the sample, condition, replicates ... indicated in the sampletable).
+ - It filters the genes with less than a minimum number of counts in a minimum number of the samples.
+ - If specified (keep_dubious), it keeps the genes that have a minimum number of counts even if they don't pass the criteria above.
+ - It runs the DESeq2 wrapper with all the relevant parameters provided by the user.
+ - It retrieves the results using the contrast provided by the user.
+ - It filters the results based on p-value or p-adj, following the user's indication, as well as the max. value (0.05, 0.1, ...)
+ - It builds a list of output results.
+
+
+```{r}
+cdh_DGE_all_broad <- list()
+for(i in unique(cdh_psbulk_cond_rep_broad$sampletable$ctype)){
+  message("starting with cell type ",i)
+  cdh_DGE_all_broad[[i]] <-
+    deseq_pseudobulk(
+      count_matrix = cdh_matrix_broad,
+      samples_info = cdh_sampletable_broad[,-2],
+      celltype = i,
+      #filter_by = "pvalue", 
+      p_threshold = 0.05,
+      contrast_info = c("condition","Cdh1","GFP"), # change for control here
+      plot_results = FALSE, min_passing_samples = 3,
+      min_counts_per_sample = 3,
+      keep_dubious = FALSE
+    )
+  message("done cell type ",i)
+}
+```
+
+## Metaplot (broad)
+
+With this plot we will show which cell types have the highest amount of D.E.G.s.
+
+As a control we can plot this compared to the cluster size, because one expects that cell types with better coverage will capture more nuances in gene expression. 
+
+```{r}
+cdh_diffreg_broad <- data.frame(
+  num_diff = sapply(
+    cdh_DGE_all_broad,
+    function(x){
+      a = x$diffgenes
+      if(is.na(a[1])){
+        b = 0
+      } else{
+        b = length(a)
+      }
+      return(b)
+    }
+  ),
+  total_genes = sapply(
+    cdh_DGE_all_broad, function(x){nrow(x$res)}
+    )
+)
+```
+
+
+```{r}
+# fraction of differentially expressed genes
+cdh_diffreg_broad$fraction_diff <- 
+  cdh_diffreg_broad$num_diff / cdh_diffreg_broad$total_genes
+```
+
+
+```{r}
+# number of cells per cluster 
+cdh_diffreg_broad <-
+  merge(
+    cdh_diffreg_broad,
+    table(scdata_metadata$cell_category),
+    by.x = 0,
+    by.y = 1,
+    all.x = TRUE
+  )
+colnames(cdh_diffreg_broad)[1] <- "cell_category"
+```
+
+
+We will quickly calculate the pseudobulk at the broadtype level (without replicates or anything) to retrieve the counts for Cdh1 for later plotting.
+
+```{r}
+smed_cdh_counts_broad <- pseudobulk(x=matrix_X,identities = scdata_metadata$cell_category)
+```
+
+```{r}
+# cdh1 h1SMcG0005288 FZR1 in rosetta
+cdh <- "h1SMcG0005288" #cdh1
+#cdh <- "h1SMcG0016295" #h2b
+cdh_diffreg_broad <-
+  merge(
+    cdh_diffreg_broad,
+    data.frame(ctype = colnames(smed_cdh_counts_broad), cdh = quantnorm(smed_cdh_counts_broad)[rownames(smed_cdh_counts_broad)==cdh,]),
+    by = 1
+  )
+```
+
+Here is the plot of the number of diff.reg. genes (logarithmic) and the level of expression of Cdh1 (logarithmic, quantile-normalised)
+
+```{r, fig.width = 5, fig.height = 5}
+p1 <- ggplot(cdh_diffreg_broad, aes(x = log1p(cdh), y = log1p(num_diff), label = cell_category)) +
+  geom_point() +
+  labs(
+    title = "Cdh1 expression vs # DiffReg",
+    x = "Cdh1 expression (log, quan.norm)",
+    y = "log no. diffreg genes (pval<.05)"
+  ) +
+  scale_color_identity()+
+  theme_minimal()+
+  geom_text_repel(cex=3) + labs(title = "Cdh1 expression vs # DiffReg")
+p1
+```
+
+
+We can also check this in relation to the size of the cluster. 
+
+```{r, fig.width = 5, fig.height = 5}
+p2 <- ggplot(cdh_diffreg_broad, aes(x = log(Freq), y = log1p(num_diff), label = cell_category)) +
+  geom_point() +
+  labs(
+    title = "broad cluster size vs # DiffReg",
+    x = "broad cluster size (log(freq))",
+    y = "num. diffreg genes (pval<.05)"
+  ) +
+  scale_color_identity()+
+  theme_minimal()+
+  geom_text_repel(cex=3) + labs(title = "broad cluster size vs # DiffReg")
+
+p2
+```
+
+## Volcano plots
+
+```{r, fig.width = 5, fig.height = 3}
+y_max <- 60 # to homogenise axis
+
+list_volcanos <- list() # list to store the plots
+
+# create a list with names(cdh_DGE_all_broad) to choose the order of the plots
+names_cdh_DGE_all_broad <- list("neoblasts",  "progenitors" ,   "differentiated")
+
+for(celltype in names_cdh_DGE_all_broad){
+  list_volcanos[[celltype]] <- cdh_DGE_all_broad[[celltype]]$res %>%
+    ggplot(aes(x = log2FoldChange, y = -log(pvalue), color = factor(padj < 0.05))) +
+    geom_point_rast(size = .75) +
+    scale_color_manual(values = c("FALSE" = unname(gb_col["black1"]), "TRUE" = "#e66056")) +
+    ylim(c(0,y_max))+
+    guides(color = "none") + 
+    theme_classic() +
+    theme(panel.border = element_rect(colour = "black", fill=NA, linewidth = 0.75), axis.title.x=element_blank(), axis.title.y=element_blank())+
+    ggtitle(label = celltype)  + 
+   # ggtitle(label = paste(strwrap(celltype, width = 15), collapse = "\n"))  + 
+    theme(text=element_text(size=8))
+}
+
+do.call("grid.arrange", c(list_volcanos, ncol = 3))
+
+```
+
+## save the data
+
+```{r}
+#saves the list of differentially expressed genes and the lfc in csv files for further analysis using python
+# identitity of the DE genes are stored here : cdh_DGE_all_broad[["neoblasts"]][["diffgenes"]]
+# lfcs are stored here: cdh_DGE_all_broad[["neoblasts"]][["res"]]
+getwd()
+
+for (i in names(cdh_DGE_all_broad)){
+  print(i)
+  li <- cdh_DGE_all_broad[[i]][["diffgenes"]]
+  tablelfc <- cdh_DGE_all_broad[[i]][["res"]]
+  tablelfc$deg = ifelse(tablelfc$padj < 0.05, "DEG", "none") # add a column with DGE results
+  
+  i <- gsub("/", "", i)
+  write.table(tablelfc, file = paste0('./outputs_V2scores/', i, '_DGE_res_Cdh1.tsv'),  sep = "\t", quote= FALSE, col.names = TRUE )
+}
+
+```
+
+```{r}
+save(
+  cdh_DGE_all_broad,
+  cdh_diffreg_broad,
+  cdh_matrix_broad,
+  cdh_sampletable_broad,
+  Idents,
+  matrix_X,
+  smed_cdh_counts_broad,
+  file = "./outputs_V2scores/260304_Cdh1_diffexp.rda"
+)
+```
+
+## repeat for H2B
+
+! this will overwrite the cdh1 variables
+
+```{r}
+cdh_DGE_all_broad <- list()
+for(i in unique(cdh_psbulk_cond_rep_broad$sampletable$ctype)){
+  message("starting with cell type ",i)
+  cdh_DGE_all_broad[[i]] <-
+    deseq_pseudobulk(
+      count_matrix = cdh_matrix_broad,
+      samples_info = cdh_sampletable_broad[,-2],
+      celltype = i,
+      #filter_by = "pvalue", 
+      p_threshold = 0.05,
+      contrast_info = c("condition","H2B","GFP"), # change for control here
+      plot_results = FALSE, min_passing_samples = 3,
+      min_counts_per_sample = 3,
+      keep_dubious = FALSE
+    )
+  message("done cell type ",i)
+}
+```
+
+## Metaplot (broad)
+
+With this plot we will show which cell types have the highest amount of D.E.G.s.
+
+As a control we can plot this compared to the cluster size, because one expects that cell types with better coverage will capture more nuances in gene expression. 
+
+```{r}
+cdh_diffreg_broad <- data.frame(
+  num_diff = sapply(
+    cdh_DGE_all_broad,
+    function(x){
+      a = x$diffgenes
+      if(is.na(a[1])){
+        b = 0
+      } else{
+        b = length(a)
+      }
+      return(b)
+    }
+  ),
+  total_genes = sapply(
+    cdh_DGE_all_broad, function(x){nrow(x$res)}
+    )
+)
+```
+
+
+```{r}
+# fraction of differentially expressed genes
+cdh_diffreg_broad$fraction_diff <- 
+  cdh_diffreg_broad$num_diff / cdh_diffreg_broad$total_genes
+```
+
+
+```{r}
+# number of cells per cluster 
+cdh_diffreg_broad <-
+  merge(
+    cdh_diffreg_broad,
+    table(scdata_metadata$cell_category),
+    by.x = 0,
+    by.y = 1,
+    all.x = TRUE
+  )
+colnames(cdh_diffreg_broad)[1] <- "cell_category"
+```
+
+We will quickly calculate the pseudobulk at the broadtype level (without replicates or anything) to retrieve the counts for Cdh1 for later plotting.
+
+```{r}
+smed_cdh_counts_broad <- pseudobulk(x=matrix_X,identities = scdata_metadata$cell_category)
+```
+
+```{r}
+# cdh1 h1SMcG0005288 FZR1 in rosetta
+#cdh <- "h1SMcG0005288" #cdh1
+cdh <- "h1SMcG0016295" #h2b
+cdh_diffreg_broad <-
+  merge(
+    cdh_diffreg_broad,
+    data.frame(ctype = colnames(smed_cdh_counts_broad), cdh = quantnorm(smed_cdh_counts_broad)[rownames(smed_cdh_counts_broad)==cdh,]),
+    by = 1
+  )
+```
+
+Here is the plot of the number of diff.reg. genes (logarithmic) and the level of expression of Cdh1 (logarithmic, quantile-normalised)
+
+```{r, fig.width = 5, fig.height = 5}
+p1 <- ggplot(cdh_diffreg_broad, aes(x = log1p(cdh), y = log1p(num_diff), label = cell_category)) +
+  geom_point() +
+  labs(
+    title = "H2B expression vs # DiffReg",
+    x = "H2B expression (log, quan.norm)",
+    y = "log no. diffreg genes (pval<.05)"
+  ) +
+  scale_color_identity()+
+  theme_minimal()+
+  geom_text_repel(cex=3) + labs(title = "H2B expression vs # DiffReg")
+p1
+```
+
+
+We can also check this in relation to the size of the cluster. 
+
+```{r, fig.width = 5, fig.height = 5}
+p2 <- ggplot(cdh_diffreg_broad, aes(x = log(Freq), y = log1p(num_diff), label = cell_category)) +
+  geom_point() +
+  labs(
+    title = "broad cluster size vs # DiffReg",
+    x = "broad cluster size (log(freq))",
+    y = "num. diffreg genes (pval<.05)"
+  ) +
+  scale_color_identity()+
+  theme_minimal()+
+  geom_text_repel(cex=3) + labs(title = "broad cluster size vs # DiffReg")
+
+p2
+```
+
+## Volcano plots
+
+```{r, fig.width = 5, fig.height = 3}
+y_max <- 60 # to homogenise axis
+
+list_volcanos <- list() # list to store the plots
+
+# create a list with names(cdh_DGE_all_broad) to choose the order of the plots
+names_cdh_DGE_all_broad <- c("neoblasts",  "progenitors" ,   "differentiated")
+
+for(celltype in names_cdh_DGE_all_broad){
+  list_volcanos[[celltype]] <- cdh_DGE_all_broad[[celltype]]$res %>%
+    ggplot(aes(x = log2FoldChange, y = -log(pvalue), color = factor(padj < 0.05))) +
+    geom_point_rast(size = .75) +
+    scale_color_manual(values = c("FALSE" = unname(gb_col["black1"]), "TRUE" = "#e66056")) +
+    ylim(c(0,y_max))+
+    guides(color = "none") + 
+    theme_classic() +
+    theme(panel.border = element_rect(colour = "black", fill=NA, linewidth = 0.75), axis.title.x=element_blank(), axis.title.y=element_blank())+
+    ggtitle(label = celltype)  + 
+   # ggtitle(label = paste(strwrap(celltype, width = 15), collapse = "\n"))  + 
+    theme(text=element_text(size=8))
+}
+
+
+do.call("grid.arrange", c(list_volcanos, ncol = 3))
+
+```
+
+## save the data
+
+```{r}
+#saves the list of differentially expressed genes and the lfc in csv files for further analysis using python
+# identitity of the DE genes are stored here : cdh_DGE_all_broad[["neoblasts"]][["diffgenes"]]
+# lfcs are stored here: cdh_DGE_all_broad[["neoblasts"]][["res"]]
+getwd()
+
+for (i in names(cdh_DGE_all_broad)){
+  print(i)
+  li <- cdh_DGE_all_broad[[i]][["diffgenes"]]
+  tablelfc <- cdh_DGE_all_broad[[i]][["res"]]
+  tablelfc$deg = ifelse(tablelfc$padj < 0.05, "DEG", "none") # add a column with DGE results
+  
+  i <- gsub("/", "", i)
+  write.table(tablelfc, file = paste0('./outputs_V2scores/', i, '_DGE_res_H2B.tsv'),  sep = "\t", quote= FALSE, col.names = TRUE )
+}
+
+```
+
+```{r}
+save(
+  cdh_DGE_all_broad,
+  cdh_diffreg_broad,
+  cdh_matrix_broad,
+  cdh_sampletable_broad,
+  Idents,
+  matrix_X,
+  smed_cdh_counts_broad,
+  file = "./outputs_V2scores/260304_H2B_diffexp.rda"
+)
+```
+
+
+
+## The End!
+
+```{r}
+sessionInfo()
+```
